@@ -15,6 +15,9 @@
 
 void ReceiveSerialData_Task(uint8_t rx_byte);
 void ParseSerialData(uint8_t *line);
+//
+void UniCom_TimedTasks(void);
+//
 uint8_t String2Uint8(uint8_t *buffer);
 uint16_t String2Uint16(uint8_t *buffer);
 uint32_t String2Uint32(uint8_t *buffer);

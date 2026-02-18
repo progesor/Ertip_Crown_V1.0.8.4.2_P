@@ -65,4 +65,8 @@ void SharedMemoryInit(void)
 	sm.emergency_stop = 0u;			// Acil durdur düğmesine basılı olup olmadığını gösteren değişken
 	// *** END: SerialComm.c değişkenleri ***
 
+	// --- NEW ---
+	sm.motor_direction = 1u;  // default CW
+	sm.hall_state = 0u;
+
 }

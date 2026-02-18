@@ -292,6 +292,8 @@ int main(void)
 			  rx_data_ready = 0u;
 		  }
 
+		  UniCom_TimedTasks();
+
 		  if(tx_data_ready)
 		  {
 			  SendSerialData(tx_buffer);

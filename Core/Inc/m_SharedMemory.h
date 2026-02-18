@@ -77,6 +77,10 @@ typedef struct
 	uint16_t time_delay;			// TIME değerini saklayan değişken
 	//*** END: SerialComm.c değişkenleri ***
 
+	// --- NEW: Motor direction / hall ---
+	volatile uint8_t motor_direction;   // 1: CW, 0: CCW
+	volatile uint8_t hall_state;        // (opsiyonel) 0/1
+
 
 } SharedMemory_t;
 

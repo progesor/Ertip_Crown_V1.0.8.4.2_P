@@ -149,9 +149,11 @@ void MotorControl_Task(void)
 
 		case MOT_STATE_MANUAL_CONTROL:
 		{
+			//float dc = sm.duty_cycle_command;
+			////float dc = sm.act_pot_value * K_POT2PWM_VALUE;
+			//DriveMotor(dc, 1u, 1u);
 			float dc = sm.duty_cycle_command;
-			//float dc = sm.act_pot_value * K_POT2PWM_VALUE;
-			DriveMotor(dc, 1u, 1u);
+			DriveMotor(dc, sm.motor_direction, 1u);   // brake_status=1 => brake OFF
 		} break;
 
 	}

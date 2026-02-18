@@ -7,10 +7,35 @@
 
 #include "m_SerialComm.h"
 #include "m_SharedMemory.h"
+#include "stm32f1xx_hal.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "stm32f1xx.h"
+
+#define FIRMWARE_NAME    "ERTIP_CROWN"
+#define FIRMWARE_VERSION "1.0.8.4.2"
+
+// Timed-run (non-blocking)
+typedef struct {
+	uint8_t active;
+	uint32_t start_ms;
+	uint32_t duration_ms;
+	float duty; // 0..1
+} timed_run_t;
+
+static timed_run_t g_timed_run = {0};
+
+// Stream telemetry
+static uint8_t g_stream_enabled = 0u;
+static uint16_t g_stream_period_ms = 50u;
+static uint32_t g_stream_last_ms = 0u;
+
+// forward
+static void UniCom_HandleLine(uint8_t *line);
+void UniCom_TimedTasks(void);
+static void UniCom_SendMotorStatus(void);
 
 // *** Değişkenler m_SerialComm.c
 uint8_t serial_comm_ready = 0u;
@@ -63,6 +88,16 @@ void ParseSerialData(uint8_t *line)
 {
     if (line == NULL) return;
     if (line[0] == '\0') return;
+
+    // 0) UniCom / Arduino protocol (SYS./DEV./PIN.)
+    // Format: "GROUP.CMD" or "GROUP.CMD:PARAM"
+    if ((line[0] == 'S' && line[1] == 'Y' && line[2] == 'S' && line[3] == '.') ||
+        (line[0] == 'D' && line[1] == 'E' && line[2] == 'V' && line[3] == '.') ||
+        (line[0] == 'P' && line[1] == 'I' && line[2] == 'N' && line[3] == '.'))
+    {
+        UniCom_HandleLine(line);
+        return;
+    }
 
     /* 1) Ping algılama: "ping;123" */
     if (line[0] == 'p' && line[1] == 'i' && line[2] == 'n' && line[3] == 'g' && line[4] == ';')
@@ -311,4 +346,289 @@ float String2Float(uint8_t *buffer)
     if (*endptr != '\0') return 0.0f;
 
     return val;
+}
+
+//-------------
+
+static void UniCom_Send(const char *s)
+{
+	if (!s) return;
+	snprintf((char*)tx_buffer, TX_BUFFER_SIZE, "%s", s);
+	tx_data_ready = 1u;
+}
+
+static void UniCom_SendAck(const char *cmd)
+{
+	char buf[96];
+	snprintf(buf, sizeof(buf), "ACK:%s", cmd);
+	UniCom_Send(buf);
+}
+
+static void UniCom_SendErr(const char *err)
+{
+	char buf[96];
+	snprintf(buf, sizeof(buf), "ERR:%s", err);
+	UniCom_Send(buf);
+}
+
+static void UniCom_Split(uint8_t *line, char *cmdOut, uint32_t cmdCap, char *paramsOut, uint32_t paramsCap)
+{
+	// cmdOut = before ':' ; paramsOut = after ':'
+	char *colon = strchr((char*)line, ':');
+	if (!colon)
+	{
+		snprintf(cmdOut, cmdCap, "%s", (char*)line);
+		paramsOut[0] = '\0';
+		return;
+	}
+	*colon = '\0';
+	snprintf(cmdOut, cmdCap, "%s", (char*)line);
+	snprintf(paramsOut, paramsCap, "%s", (colon + 1));
+}
+
+static void UniCom_SendMotorStatus(void)
+{
+	// Encoder + akım + voltaj zaten sm içinde var.
+	// Not: I; komutundaki formatı bozmayalım, burada Arduino tarzı DATA döndürüyoruz.
+	char buf[200];
+	snprintf(buf, sizeof(buf),
+			"DATA:MOTOR:%.2f:%.2f:%.3f:%.2f:%.4f:%u:%u",
+			(float)sm.act_position_relative,     // deg
+			(float)sm.act_velocity,              // rpm
+			(float)sm.act_motor_current,         // A
+			(float)sm.act_motor_voltage,         // V
+			(float)sm.act_pwm_duty,              // 0..1
+			(unsigned)sm.hall_state,             // 0/1 (şimdilik 0 kalabilir)
+			(unsigned)sm.control_mode            // 0/1/2
+	);
+	UniCom_Send(buf);
+}
+
+static void UniCom_HandleLine(uint8_t *line)
+{
+	char cmd[64];
+	char params[96];
+	UniCom_Split(line, cmd, sizeof(cmd), params, sizeof(params));
+
+	// --- SYS ---
+	if (strcmp(cmd, "SYS.PING") == 0)
+	{
+		UniCom_Send("PONG");
+		return;
+	}
+	if (strcmp(cmd, "SYS.INFO") == 0)
+	{
+		char buf[96];
+		snprintf(buf, sizeof(buf), "INFO:%s:%s", FIRMWARE_NAME, FIRMWARE_VERSION);
+		UniCom_Send(buf);
+		return;
+	}
+	if (strcmp(cmd, "SYS.RESET") == 0)
+	{
+		// cevap dönmeden reset
+		NVIC_SystemReset();
+		return;
+	}
+
+	// --- DEV.MOTOR ---
+	if (strcmp(cmd, "DEV.MOTOR.SET_PWM") == 0)
+	{
+		int pwm = atoi(params); // 0..255
+		if (pwm < 0) pwm = 0;
+		if (pwm > 255) pwm = 255;
+
+		// Manual mode'a geç: STM32 state machine bunu OP_STATE_MAN_MODE ile yönetiyor
+		sm.control_mode = 2u;                    // 2 => manual
+		sm.duty_cycle_command = (float)pwm / 255.0f;
+
+		// Başlat: idle state, operation_start görünce MAN mode'a geçiyor
+		sm.operation_start = 1u;
+		sm.operation_stop  = 0u;
+
+		UniCom_SendAck("DEV.MOTOR.SET_PWM");
+		return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.SET_DIR") == 0)
+	{
+		int dir = atoi(params); // 0/1
+		sm.motor_direction = (dir != 0) ? 1u : 0u;
+		UniCom_SendAck("DEV.MOTOR.SET_DIR");
+		return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.STOP") == 0)
+	{
+		g_timed_run.active = 0u;
+		sm.operation_stop = 1u; // main state machine motoru durduracak
+		UniCom_SendAck("DEV.MOTOR.STOP");
+		return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.EXEC_TIMED_RUN") == 0)
+	{
+		// params: "PWM|MS"
+		char *sep = strchr(params, '|');
+		if (!sep) { UniCom_SendErr("INVALID_PARAM"); return; }
+		*sep = '\0';
+
+		int pwm = atoi(params);
+		int ms  = atoi(sep + 1);
+
+		if (pwm < 0) pwm = 0;
+		if (pwm > 255) pwm = 255;
+		if (ms < 0) ms = 0;
+
+		g_timed_run.active = 1u;
+		g_timed_run.start_ms = HAL_GetTick();
+		g_timed_run.duration_ms = (uint32_t)ms;
+		g_timed_run.duty = (float)pwm / 255.0f;
+
+		sm.control_mode = 2u;
+		sm.duty_cycle_command = g_timed_run.duty;
+		sm.operation_start = 1u;
+		sm.operation_stop  = 0u;
+
+		UniCom_SendAck("DEV.MOTOR.EXEC_TIMED_RUN");
+		return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.GET_STATUS") == 0)
+	{
+		UniCom_SendMotorStatus();
+		return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.STREAM") == 0)
+	{
+		// params: "0/1|period_ms"  (period opsiyonel)
+		// ör: "1|50"
+		char *sep = strchr(params, '|');
+		int en = 0;
+		int per = (int)g_stream_period_ms;
+
+		if (sep)
+		{
+			*sep = '\0';
+			en = atoi(params);
+			per = atoi(sep + 1);
+		}
+		else
+		{
+			en = atoi(params);
+		}
+
+		g_stream_enabled = (en != 0) ? 1u : 0u;
+		if (per >= 5 && per <= 1000) g_stream_period_ms = (uint16_t)per;
+		g_stream_last_ms = HAL_GetTick();
+
+		UniCom_SendAck("DEV.MOTOR.STREAM");
+		return;
+	}
+
+	// --- PIN.* (sen devre dışı bırakmak istiyorsun) ---
+	if (strncmp(cmd, "PIN.", 4) == 0)
+	{
+		UniCom_SendErr("UNSUPPORTED");
+		return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.SET_MODE") == 0)
+	{
+	    if (strcmp(params, "CONT") == 0) {
+	        sm.control_mode = 0u;
+	        UniCom_SendAck("DEV.MOTOR.SET_MODE");
+	        return;
+	    }
+	    if (strcmp(params, "OSC") == 0) {
+	        sm.control_mode = 1u;
+	        UniCom_SendAck("DEV.MOTOR.SET_MODE");
+	        return;
+	    }
+	    UniCom_SendErr("INVALID_PARAM");
+	    return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.SET_RPM") == 0)
+	{
+	    float rpm = (float)atof(params);
+	    if (rpm < 0) rpm = 0;
+	    sm.ref_velocity = rpm;
+	    UniCom_SendAck("DEV.MOTOR.SET_RPM");
+	    return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.OSC.SET_AMP") == 0)
+	{
+	    float amp_deg = (float)atof(params);
+	    if (amp_deg < 0) amp_deg = -amp_deg;
+	    sm.ref_position = amp_deg;      // projede amplitude gibi kullanılıyor
+	    UniCom_SendAck("DEV.MOTOR.OSC.SET_AMP");
+	    return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.OSC.SET_RPM") == 0)
+	{
+	    float rpm = (float)atof(params);
+	    if (rpm < 0) rpm = 0;
+	    sm.ref_velocity = rpm;
+	    UniCom_SendAck("DEV.MOTOR.OSC.SET_RPM");
+	    return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.OSC.SET_DWELL") == 0)
+	{
+	    int ms = atoi(params);
+	    if (ms < 0) ms = 0;
+	    sm.time_delay = (uint16_t)ms;
+	    UniCom_SendAck("DEV.MOTOR.OSC.SET_DWELL");
+	    return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.START") == 0)
+	{
+	    sm.operation_start = 1u;
+	    sm.operation_stop  = 0u;
+	    UniCom_SendAck("DEV.MOTOR.START");
+	    return;
+	}
+
+	if (strcmp(cmd, "DEV.MOTOR.STOP") == 0)
+	{
+	    sm.operation_stop = 1u;
+	    UniCom_SendAck("DEV.MOTOR.STOP");
+	    return;
+	}
+
+	UniCom_SendErr("INVALID_CMD");
+}
+
+void UniCom_TimedTasks(void)
+{
+	// Timed-run bitiş kontrolü
+	if (g_timed_run.active)
+	{
+		uint32_t now = HAL_GetTick();
+		if ((now - g_timed_run.start_ms) >= g_timed_run.duration_ms)
+		{
+			g_timed_run.active = 0u;
+			sm.operation_stop = 1u;
+			UniCom_Send("DONE:DEV.MOTOR.EXEC_TIMED_RUN");
+		}
+	}
+
+	// Telemetry stream
+	if (g_stream_enabled)
+	{
+		uint32_t now = HAL_GetTick();
+		if ((now - g_stream_last_ms) >= g_stream_period_ms)
+		{
+			g_stream_last_ms = now;
+			// tx buffer meşgulse çakışma olmasın: basit koruma
+			if (!tx_data_ready)
+			{
+				UniCom_SendMotorStatus();
+			}
+		}
+	}
 }
